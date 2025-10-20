@@ -4,47 +4,97 @@ from mcp import stdio_client, StdioServerParameters
 from strands import Agent
 from strands.tools.mcp import MCPClient
 
-st.set_page_config(page_title="MCP Agent Demo", page_icon="🤖", layout="wide")
-st.title("🤖 MCP Agent with AWS Documentation")
-
-uvx_path = os.path.expanduser("~/.local/bin/uvx")
+st.set_page_config(page_title="Redshift Query Chatbot", page_icon="💰", layout="wide")
+st.title("💰 AWS Cost Analysis Chatbot")
 
 @st.cache_resource
-def init_mcp_client():
+def init_redshift_client():
+    """Redshift MCP 클라이언트 초기화"""
     client = MCPClient(lambda: stdio_client(
-        StdioServerParameters(command=uvx_path, args=["awslabs.aws-documentation-mcp-server@latest"])
+        StdioServerParameters(
+            command="uvx",
+            args=["awslabs.redshift-mcp-server@latest"],
+            env={
+                "AWS_DEFAULT_REGION": "us-east-1",
+                "FASTMCP_LOG_LEVEL": "ERROR"
+            }
+        )
     ))
     client.start()
     return client
 
 @st.cache_resource
 def init_agent(_mcp_client):
+    """Agent 초기화"""
     tools = _mcp_client.list_tools_sync()
-    return Agent(tools=tools)
+    
+    system_prompt = """You are an AWS cost analysis assistant with access to Redshift.
 
+Available resources:
+- Cluster: cur-analytics
+- Database: curdb
+- Schema: cur
+- Table: cost_and_usage (AWS Cost and Usage Report data)
+
+When users ask about AWS costs:
+1. Understand their question
+2. Create appropriate SQL query for cur.cost_and_usage table
+3. Execute the query on cur-analytics cluster
+4. Present results in a clear, conversational way
+
+Common columns in cost_and_usage:
+- line_item_usage_account_id: AWS account ID
+- line_item_usage_start_date: Usage date
+- line_item_product_code: AWS service (EC2, S3, etc)
+- line_item_unblended_cost: Cost amount
+- line_item_usage_type: Usage type
+
+Always be helpful and explain the results in plain language."""
+    
+    return Agent(tools=tools, system_prompt=system_prompt)
+
+# 세션 상태 초기화
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "mcp_client" not in st.session_state:
-    with st.spinner("MCP 서버 연결 중..."):
-        st.session_state.mcp_client = init_mcp_client()
-        st.session_state.agent = init_agent(st.session_state.mcp_client)
-    st.success("✅ 연결 완료!")
+if "redshift_client" not in st.session_state:
+    with st.spinner("Redshift 연결 중..."):
+        try:
+            st.session_state.redshift_client = init_redshift_client()
+            st.session_state.agent = init_agent(st.session_state.redshift_client)
+            st.success("✅ Redshift 연결 완료!")
+        except Exception as e:
+            st.error(f"❌ 연결 실패: {str(e)}")
+            st.stop()
 
-# 사이드바 - 예시 질문만
+# 사이드바 - 예시 질문
 with st.sidebar:
     st.header("💡 예시 질문")
+    
     examples = [
-        "AWS Lambda가 뭐야?",
-        "CUR이 뭐야? 예시 쿼리랑 설명 알려줘",
-        "S3 버킷 생성 방법",
-        "EC2 인스턴스 타입 비교"
+        "상위 10개 계정의 비용을 보여줘",
+        "총 계정이 몇 개야?",
+        "월별 비용 추이를 알려줘",
+        "계정 233255838270의 서비스별 비용은?",
+        "가장 비싼 서비스 5개는 뭐야?",
+        "7월 데이터만 보여줘"
     ]
     
     for q in examples:
         if st.button(q, key=q, use_container_width=True):
             st.session_state.messages.append({"role": "user", "content": q})
             st.rerun()
+    
+    st.divider()
+    
+    # 데이터 정보
+    st.subheader("📊 데이터 정보")
+    st.info("""
+    **Cluster:** cur-analytics  
+    **Database:** curdb  
+    **Schema:** cur  
+    **Table:** cost_and_usage
+    """)
     
     st.divider()
     
@@ -55,18 +105,27 @@ with st.sidebar:
 # 메인 채팅 영역
 st.divider()
 
+# 기존 메시지 표시
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("질문을 입력하세요..."):
+# 사용자 입력
+if prompt := st.chat_input("AWS 비용에 대해 질문하세요..."):
+    # 사용자 메시지 추가
     st.session_state.messages.append({"role": "user", "content": prompt})
     
     with st.chat_message("user"):
         st.markdown(prompt)
     
+    # AI 응답
     with st.chat_message("assistant"):
-        with st.spinner("생각 중..."):
-            response = st.session_state.agent(prompt)
-        st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        with st.spinner("쿼리 실행 중..."):
+            try:
+                response = st.session_state.agent(prompt)
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+            except Exception as e:
+                error_msg = f"❌ 오류 발생: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
