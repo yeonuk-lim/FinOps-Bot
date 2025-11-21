@@ -2,13 +2,12 @@ import streamlit as st
 from mcp import stdio_client, StdioServerParameters
 from strands import Agent
 from strands.tools.mcp import MCPClient
-# Strands의 이벤트/블록 타입 (가상의 SDK 구조 가정)
-from strands.types import ToolUseBlock, TextBlock
+# from strands.types import ... (이 줄을 삭제하여 에러 방지)
 
 st.set_page_config(page_title="Redshift Cost Agent", page_icon="💰", layout="wide")
-st.title("💰 AWS Cost Analysis Agent (Strands Native)")
+st.title("💰 AWS Cost Analysis Agent (Safe Mode)")
 
-# --- 1. 초기화 및 캐싱 (최적화) ---
+# --- 1. 초기화 및 캐싱 ---
 
 @st.cache_resource
 def get_mcp_client():
@@ -29,13 +28,10 @@ def get_cached_tools():
     client = get_mcp_client()
     return client.list_tools_sync()
 
-# --- 2. 에이전트 설정 (프롬프트 다이어트) ---
+# --- 2. 에이전트 설정 ---
 
 def get_agent():
-    """
-    Agent 인스턴스 생성. 
-    예산 관리 로직은 프롬프트에서 제거하고 순수 분석 지침만 남김.
-    """
+    """Agent 인스턴스 생성"""
     tools = get_cached_tools()
     
     system_prompt = """You are an expert AWS cost analyst leveraging Redshift data.
@@ -47,10 +43,9 @@ Data Schema:
 Analysis Guidelines:
 1. Always filter by 'line_item_usage_start_date'.
 2. Aggregate data using SUM/COUNT to provide meaningful insights.
-3. When a user asks about cost trends, analyze the last 3 months unless specified.
-4. Generate efficient SQL queries.
+3. Generate efficient SQL queries.
 """
-    # Strands Agent는 상태를 내부적으로 가지지 않고, run 시점에 messages를 받도록 설계됨
+    # Strands Agent 생성
     return Agent(model="anthropic.claude-3-5-sonnet-v2:0", tools=tools, system_prompt=system_prompt)
 
 # --- 3. 세션 상태 관리 ---
@@ -82,7 +77,7 @@ with st.sidebar:
         st.session_state.waiting_for_confirmation = False
         st.rerun()
 
-# --- 5. 메인 로직 (Generator Loop 제어) ---
+# --- 5. 메인 로직 ---
 
 # 채팅 히스토리 렌더링
 for msg in st.session_state.messages:
@@ -92,7 +87,7 @@ for msg in st.session_state.messages:
 # 사용자 입력 처리
 if prompt := st.chat_input("AWS 비용 질문을 입력하세요..."):
     
-    # 1. 확인 대기 상태 처리
+    # 1. 확인 대기 상태 처리 (예산 초과 후 승인 여부)
     if st.session_state.waiting_for_confirmation:
         if any(x in prompt.lower() for x in ['y', '예', '응', 'yes', 'go']):
             st.session_state.query_count = 0 # 카운트 리셋
@@ -100,14 +95,12 @@ if prompt := st.chat_input("AWS 비용 질문을 입력하세요..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             st.chat_message("user").markdown(prompt)
             
-            # 승인 메시지 후 AI가 '이전 질문'을 다시 수행하도록 유도하려면
-            # 실제로는 마지막 AI 턴을 재생성하거나 해야 하지만, 
-            # 여기서는 간단히 "승인되었으니 답변을 생성합니다" 로직으로 진행
             with st.chat_message("assistant"):
-                st.info("✅ 승인되었습니다. 분석을 계속합니다.")
-                # (심화 구현 시: 직전 ToolCall을 재실행하는 로직이 필요함)
+                st.info("✅ 승인되었습니다. 다시 질문해주시면 분석을 수행합니다.")
+                # (구조상 직전 컨텍스트를 이어가려면 메시지 처리가 복잡해지므로, 
+                # 여기서는 UX적으로 다시 질문을 유도하거나 재실행하는 흐름으로 안내)
         else:
-            st.warning("작업이 취소되었습니다.")
+            st.warning("작업이 중단되었습니다.")
             st.session_state.waiting_for_confirmation = False
             st.stop()
 
@@ -124,19 +117,23 @@ if prompt := st.chat_input("AWS 비용 질문을 입력하세요..."):
             # Agent 가져오기
             agent = get_agent()
             
-            # Strands Stream 실행 (History 객체 그대로 전달)
-            # stream=True를 통해 토큰/이벤트 단위 제어
-            stream = agent.run(
-                messages=st.session_state.messages,
-                stream=True
-            )
-            
             try:
-                # --- CORE LOOP: Code-Level Control ---
+                # Strands Stream 실행
+                stream = agent.run(
+                    messages=st.session_state.messages,
+                    stream=True
+                )
+                
+                # --- CORE LOOP: Import 없는 안전한 방식 ---
                 for event in stream:
                     
+                    # 이벤트의 클래스 이름을 문자열로 확인 (Import 에러 방지)
+                    event_type_name = type(event).__name__
+                    
                     # Case A: 도구 사용(쿼리) 시도 감지
-                    if isinstance(event, ToolUseBlock):
+                    # 클래스 이름에 'Tool'과 'Use' 또는 'Call'이 포함되어 있으면 잡음
+                    if "Tool" in event_type_name and ("Use" in event_type_name or "Call" in event_type_name):
+                        
                         # 예산 체크
                         if st.session_state.query_count >= max_queries:
                             st.session_state.waiting_for_confirmation = True
@@ -144,33 +141,41 @@ if prompt := st.chat_input("AWS 비용 질문을 입력하세요..."):
                             full_response += warning_msg
                             message_placeholder.markdown(full_response)
                             
-                            # ★ 여기서 Loop 강제 중단 (쿼리 실행 막음)
-                            # Generator를 멈추면 실제 Tool Execution이 발생하지 않음
+                            # ★ Loop 강제 중단 (실제 쿼리 실행 차단)
                             break 
                         
-                        # 예산 내라면 카운트 증가 후 진행 허용
+                        # 예산 내라면 카운트 증가
                         st.session_state.query_count += 1
-                        # (Optional) UI에 쿼리 실행 중임을 표시
-                        full_response += f"\n\n*🔍 [Query 실행] {event.tool_name}...*\n\n"
+                        
+                        # 도구 이름 추출 (안전하게)
+                        tool_name = getattr(event, 'tool_name', 'Query Tool')
+                        
+                        # UI 업데이트
+                        status_msg = f"\n\n*🔍 [Query 실행] {tool_name} (예산: {st.session_state.query_count}/{max_queries})*\n\n"
+                        full_response += status_msg
                         message_placeholder.markdown(full_response)
 
-                    # Case B: 일반 텍스트 생성
-                    elif isinstance(event, TextBlock):
+                    # Case B: 일반 텍스트 생성 (속성 체크)
+                    elif hasattr(event, 'text'):
                         full_response += event.text
                         message_placeholder.markdown(full_response + "▌")
                     
-                    # Case C: 그냥 텍스트 스트림 (Strands 버전에 따라 다름)
+                    # Case C: 문자열 자체가 들어오는 경우
                     elif isinstance(event, str):
                         full_response += event
                         message_placeholder.markdown(full_response + "▌")
+                    
+                    # 그 외 이벤트는 무시
+                    else:
+                        pass
 
                 message_placeholder.markdown(full_response)
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-                # 승인 대기 상태면 Rerun 하여 입력창 활성화
+                # 승인 대기 상태가 되었으면 Rerun
                 if st.session_state.waiting_for_confirmation:
                     st.rerun()
 
             except Exception as e:
-                st.error(f"에러 발생: {e}")
-
+                st.error(f"시스템 오류: {str(e)}")
+                st.code(f"Event Debug Info: {type(event).__name__} - {event}")
