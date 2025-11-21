@@ -51,10 +51,10 @@ def create_agent(mcp_client, query_count=0, max_queries=5):
    - Get all needed data in single query when possible
 
 Available resources:
-- Cluster: cur-analytics
-- Database: curdb
+- Cluster: redshift
+- Database: cur_database
 - Schema: cur
-- Table: cost_and_usage
+- Table: cost_and_usage_report
 
 Common columns:
 - line_item_usage_account_id: AWS account ID
