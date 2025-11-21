@@ -4,9 +4,11 @@ from mcp import stdio_client, StdioServerParameters
 from strands import Agent
 from strands.tools.mcp import MCPClient
 
+# 1. 페이지 설정 (가장 먼저 실행)
 st.set_page_config(page_title="Redshift Query Chatbot", page_icon="💰", layout="wide")
 st.title("💰 AWS Cost Analysis Chatbot")
 
+# 2. Redshift 클라이언트 초기화
 @st.cache_resource
 def init_redshift_client():
     """Redshift MCP 클라이언트 초기화"""
@@ -23,6 +25,7 @@ def init_redshift_client():
     client.start()
     return client
 
+# 3. Agent 생성 함수
 def create_agent(mcp_client, query_count=0, max_queries=5):
     """Agent 생성 with query limit awareness"""
     tools = mcp_client.list_tools_sync()
@@ -53,7 +56,7 @@ def create_agent(mcp_client, query_count=0, max_queries=5):
 Available resources:
 - Cluster: redshift
 - Database: cur_database
-- Schema: cur
+- Schema: public
 - Table: cost_and_usage_report
 
 Common columns:
@@ -84,36 +87,21 @@ LIMIT 10;
     
     return Agent(tools=tools, system_prompt=system_prompt)
 
+# 4. 유틸리티 함수들
 def get_conversation_context(messages, max_pairs=3):
-    """
-    최근 N개의 대화 쌍만 가져와서 컨텍스트 구성
-    
-    Args:
-        messages: 전체 메시지 리스트
-        max_pairs: 포함할 최대 대화 쌍 개수 (기본 3)
-    
-    Returns:
-        컨텍스트 문자열
-    """
     if len(messages) <= 1:
         return ""
-    
-    # 마지막 메시지 제외하고 최근 N쌍만 가져오기
     max_messages = max_pairs * 2
     recent_messages = messages[-(max_messages + 1):-1]
-    
     if not recent_messages:
         return ""
-    
     context_parts = []
     for msg in recent_messages:
         role = "사용자" if msg["role"] == "user" else "AI"
         context_parts.append(f"{role}: {msg['content']}")
-    
     return "\n\n".join(context_parts)
 
 def is_user_confirmation(text):
-    """사용자가 계속 진행을 확인했는지 체크"""
     text_lower = text.lower().strip()
     confirmation_keywords = [
         '예', 'yes', 'y', '네', '응', '그래', '계속', '진행', 
@@ -121,7 +109,12 @@ def is_user_confirmation(text):
     ]
     return any(keyword in text_lower for keyword in confirmation_keywords)
 
-# 세션 상태 초기화
+# [수정됨] 사이드바 버튼 클릭 처리를 위한 콜백 함수
+def handle_example_click(message_text):
+    st.session_state.messages.append({"role": "user", "content": message_text})
+    st.session_state.waiting_for_confirmation = False
+
+# 5. 세션 상태 초기화
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -140,22 +133,22 @@ if "redshift_client" not in st.session_state:
             st.error(f"❌ 연결 실패: {str(e)}")
             st.stop()
 
-# 사이드바 - 예시 질문
+# 6. 사이드바 구성
 with st.sidebar:
     st.header("💡 예시 질문")
     
     examples = [
         {
             "short": "RI/SP 현황 (3개 계정)",
-            "full": "삼성클라우드(775638497521), 삼성페이(622803788537), 삼성헬스(657197638512) 서비스의 EC2 인스턴스를 Reserved Instance와 Savings Plan 현재 상황 알려줘"
+            "full": "삼성클라우드(775638497521), 삼성페이(622803788537), 삼성헬스(657197638512) 서비스의 최근 3개월 EC2 인스턴스를 Reserved Instance와 Savings Plan 상황 알려줘"
         },
         {
             "short": "비용 절감 플랜",
-            "full": "삼성클라우드(775638497521) 비용 절감 플랜과 연간 절감 가능금액 알려줘"
+            "full": "삼성클라우드(775638497521) 비용 절감 플랜과 연간 절감 가능금액을 최근 3개월 데이터기반으로 알려줘"
         },
         {
             "short": "사용자당 비용 분석",
-            "full": "빅스비(642977738847) 계정의 사용자당 월 AWS 비용 계산하고, 리소스 사용 패턴과 비효율적인 부분 찾아줘"
+            "full": "빅스비(642977738847) 계정의 사용자당 월 AWS 비용 최근 3개월 계산하고, 리소스 사용 패턴과 비효율적인 부분 찾아줘"
         },
         {
             "short": "월별 비용 급증 분석",
@@ -167,16 +160,16 @@ with st.sidebar:
         }
     ]
     
+    # [수정됨] on_click 콜백을 사용하여 버튼 동작 개선
     for i, example in enumerate(examples):
-        if st.button(
+        st.button(
             example["short"], 
             key=f"example_{i}", 
             use_container_width=True,
-            help=example["full"]
-        ):
-            st.session_state.messages.append({"role": "user", "content": example["full"]})
-            st.session_state.waiting_for_confirmation = False
-            st.rerun()
+            help=example["full"],
+            on_click=handle_example_click,
+            args=(example["full"],)
+        )
     
     st.divider()
     
@@ -190,7 +183,6 @@ with st.sidebar:
     with col2:
         st.metric("제한", f"{max_queries}회")
     
-    # 진행률 표시
     progress = min(st.session_state.query_count / max_queries, 1.0)
     st.progress(progress)
     
@@ -199,46 +191,9 @@ with st.sidebar:
     
     st.divider()
     
-    # 대화 컨텍스트 설정
     st.subheader("⚙️ 설정")
-    context_pairs = st.slider(
-        "대화 컨텍스트 유지 개수",
-        min_value=0,
-        max_value=10,
-        value=3,
-        help="이전 대화 몇 개를 기억할지 설정"
-    )
+    context_pairs = st.slider("대화 컨텍스트 유지 개수", 0, 10, 3)
     st.session_state.context_pairs = context_pairs
-    
-    st.divider()
-    
-    # 데이터 정보
-    st.subheader("📊 데이터 정보")
-    st.info("""
-    **Cluster:** cur-analytics  
-    **Database:** curdb  
-    **Schema:** cur  
-    **Table:** cost_and_usage
-    """)
-    
-    st.divider()
-    
-    # 성능 팁
-    st.subheader("⚡ 성능 팁")
-    st.warning("""
-    **빠른 쿼리를 위해:**
-    - 날짜 범위를 명시하세요
-      (예: "2025년 9월", "최근 30일")
-    - 특정 계정/서비스를 지정하세요
-    - TOP 10, TOP 100 등으로 제한하세요
-    
-    **느린 예시:**
-    ❌ "전체 계정의 모든 비용"
-    
-    **빠른 예시:**
-    ✅ "2025년 9월 상위 10개 계정"
-    ✅ "최근 30일 EC2 비용"
-    """)
     
     st.divider()
     
@@ -248,25 +203,29 @@ with st.sidebar:
         st.session_state.waiting_for_confirmation = False
         st.rerun()
 
-# 메인 채팅 영역
+# 7. 메인 채팅 영역
 st.divider()
 
-# 기존 메시지 표시
+# 메시지 히스토리 출력
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# AI 응답 로직
+# 사용자 입력 처리 (채팅창 입력)
+if prompt := st.chat_input("AWS 비용에 대해 질문하세요..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.rerun()
+
+# 8. AI 응답 로직 (마지막 메시지가 user일 때 실행)
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     with st.chat_message("assistant"):
         with st.spinner("쿼리 실행 중..."):
             try:
                 user_message = st.session_state.messages[-1]["content"]
                 
-                # 사용자가 확인 대기 중이었다면
+                # 확인 대기 로직
                 if st.session_state.waiting_for_confirmation:
                     if is_user_confirmation(user_message):
-                        # 확인 받음 - 쿼리 카운트 리셋하고 계속 진행
                         st.session_state.query_count = 0
                         st.session_state.waiting_for_confirmation = False
                         response_text = "알겠습니다. 추가 쿼리를 진행하겠습니다."
@@ -274,73 +233,54 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                         st.session_state.messages.append({"role": "assistant", "content": response_text})
                         st.rerun()
                     else:
-                        # 거부 - 종료
                         st.session_state.waiting_for_confirmation = False
                         response_text = "알겠습니다. 추가 쿼리 없이 현재까지의 정보로 답변드리겠습니다."
                         st.markdown(response_text)
                         st.session_state.messages.append({"role": "assistant", "content": response_text})
                         st.stop()
                 
-                # 컨텍스트 개수 가져오기
+                # 컨텍스트 구성
                 max_pairs = st.session_state.get("context_pairs", 3)
-                
-                # 대화 컨텍스트 구성
-                conversation_context = get_conversation_context(
-                    st.session_state.messages, 
-                    max_pairs=max_pairs
-                )
-                
-                # 현재 질문
+                conversation_context = get_conversation_context(st.session_state.messages, max_pairs=max_pairs)
                 current_question = st.session_state.messages[-1]["content"]
                 
-                # 전체 프롬프트 구성
                 if conversation_context and max_pairs > 0:
-                    full_prompt = f"""[이전 대화]
-{conversation_context}
-
-[현재 질문]
-{current_question}
-
-위 대화 맥락을 고려하여 현재 질문에 답변해주세요."""
+                    full_prompt = f"""[이전 대화]\n{conversation_context}\n\n[현재 질문]\n{current_question}\n\n위 대화 맥락을 고려하여 현재 질문에 답변해주세요."""
                 else:
                     full_prompt = current_question
                 
-                # Agent 생성 (현재 쿼리 카운트 전달)
+                # Agent 생성
                 agent = create_agent(
                     st.session_state.redshift_client,
                     query_count=st.session_state.query_count,
                     max_queries=5
                 )
                 
-                # 쿼리 실행 전 카운트 저장
-                initial_count = st.session_state.query_count
-                
                 # Agent 실행
-                response = agent(full_prompt)
+                result_obj = agent(full_prompt)
                 
-                # 쿼리 카운트 증가 (실제로는 tool 호출 횟수를 추적해야 하지만, 
-                # 여기서는 간단히 응답마다 증가시킴)
-                estimated_queries = response.count("SELECT") if "SELECT" in response else 1
+                # [수정됨] AgentResult 객체에서 텍스트 추출 (속성명이 .text라고 가정)
+                # strands 버전에 따라 .text 혹은 .content 일 수 있습니다.
+                response_text = getattr(result_obj, 'text', str(result_obj))
+                
+                # 쿼리 카운트 계산
+                estimated_queries = response_text.count("SELECT") if "SELECT" in response_text else 1
                 st.session_state.query_count += estimated_queries
                 
-                # 응답에 쿼리 제한 도달 메시지가 있는지 확인
-                if "추가로" in response and "쿼리가 필요합니다" in response and "계속 진행할까요" in response:
+                # 확인 필요 여부 체크
+                if "추가로" in response_text and "쿼리가 필요합니다" in response_text and "계속 진행할까요" in response_text:
                     st.session_state.waiting_for_confirmation = True
                 
-                st.markdown(response)
+                # 결과 출력
+                st.markdown(response_text)
                 
-                # 쿼리 사용량 표시
                 if estimated_queries > 0:
                     st.caption(f"📊 이번 응답에서 약 {estimated_queries}개의 쿼리 실행됨 (총 {st.session_state.query_count}개)")
                 
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                # 대화 기록 저장
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
                 
             except Exception as e:
                 error_msg = f"❌ 오류 발생: {str(e)}"
                 st.error(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-# 사용자 입력
-if prompt := st.chat_input("AWS 비용에 대해 질문하세요..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.rerun()
