@@ -1,30 +1,34 @@
 import streamlit as st
 import os
+import traceback
 from mcp import stdio_client, StdioServerParameters
 from strands import Agent
-# [변경] Hook 관련 최신 모듈 임포트
-from strands.hooks import HookProvider, HookRegistry, AfterToolCallEvent
+# [수정] 인터럽트는 실행 전(Before)에만 가능하므로 BeforeToolCallEvent 추가
+from strands.hooks import HookProvider, HookRegistry, AfterToolCallEvent, BeforeToolCallEvent
 from strands.tools.mcp import MCPClient
 
 # -------------------------------------------------------------------------
-# 1. 커스텀 Hook 정의 (최신 버전 문법 적용)
+# 1. 커스텀 Hook 정의 (수정됨: 카운트와 인터럽트 분리)
 # -------------------------------------------------------------------------
 class ToolCallLimitHook(HookProvider):
     def __init__(self, soft_limit=5):
         self.soft_limit = soft_limit
         self.tool_call_count = 0
     
-    # [변경] HookRegistry에 콜백 등록
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
-        # 툴 실행 직후 카운트를 확인하기 위해 AfterToolCallEvent 사용
-        registry.add_callback(AfterToolCallEvent, self.check_limit)
-        
-    def check_limit(self, event: AfterToolCallEvent) -> None:
+        # 1. 실행 전: 제한 횟수 초과 여부 검사 (검문소)
+        registry.add_callback(BeforeToolCallEvent, self.check_limit_before_run)
+        # 2. 실행 후: 사용 횟수 카운트 증가 (계수기)
+        registry.add_callback(AfterToolCallEvent, self.increment_counter)
+
+    def increment_counter(self, event: AfterToolCallEvent) -> None:
+        """툴 실행이 끝나면 카운트를 1 올립니다."""
         self.tool_call_count += 1
-        
+
+    def check_limit_before_run(self, event: BeforeToolCallEvent) -> None:
+        """툴 실행 전에 제한을 넘었는지 확인하고 멈춥니다."""
         if self.tool_call_count >= self.soft_limit:
-            # [변경] 예외 발생(raise) 대신 event.interrupt() 호출
-            # name: 인터럽트 식별자, reason: 전달할 데이터
+            # [핵심] 실행 전 이벤트에서만 interrupt 가능
             event.interrupt(
                 name="tool_limit_reached",
                 reason={
@@ -104,7 +108,6 @@ LIMIT 10;
     
     hooks = [ToolCallLimitHook(soft_limit=5)] if with_hook else []
     
-    # hooks는 리스트 형태로 전달
     return Agent(tools=tools, system_prompt=system_prompt, hooks=hooks)
 
 # -------------------------------------------------------------------------
@@ -206,33 +209,36 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- [변경] Interrupt 상태 처리 UI ---
+# --- [수정] Interrupt 상태 처리 UI ---
 if st.session_state.interrupt_state:
     intr_data = st.session_state.interrupt_state
     
-    st.info("**📊 중간 결과 (5번 쿼리 완료)**")
+    st.info(f"**📊 중간 결과 ({intr_data['message']})**")
     st.markdown(intr_data["partial_summary"])
     
-    st.warning(f"⚠️ {intr_data['message']} 계속 진행하시겠습니까?")
+    st.warning("계속 진행하시겠습니까?")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✅ 계속 분석", use_container_width=True):
             with st.spinner("분석 계속 중..."):
                 try:
-                    # [핵심 변경] agent.resume() -> agent(responses)
                     agent = intr_data["agent"]
                     interrupt_id = intr_data["interrupt_id"]
                     
-                    # 인터럽트에 대한 응답 구조 생성
+                    # [중요] 계속 진행하려면 Hook의 리밋을 늘려줘야 함 (안 그러면 바로 다시 멈춤)
+                    if agent.hooks and isinstance(agent.hooks[0], ToolCallLimitHook):
+                        agent.hooks[0].soft_limit += 5  # 5회 추가 연장
+                    
+                    # 인터럽트 응답 생성 (계속 진행)
                     responses = [{
                         "interruptResponse": {
                             "interruptId": interrupt_id,
-                            "response": "continue" # 훅에서 별도 처리가 필요 없다면 단순 문자열 전달
+                            "response": "continue" 
                         }
                     }]
                     
-                    # 에이전트 재실행 (응답 포함)
+                    # 에이전트 재개 (agent.resume 대신 호출)
                     result_obj = agent(responses)
                     
                     # 결과 처리
@@ -243,6 +249,7 @@ if st.session_state.interrupt_state:
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ 오류 발생: {str(e)}")
+                    st.code(traceback.format_exc())
                     st.session_state.interrupt_state = None
     
     with col2:
@@ -260,7 +267,7 @@ if prompt := st.chat_input("AWS 비용에 대해 질문하세요..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.rerun()
 
-# --- [변경] AI 응답 로직 (stop_reason 사용) ---
+# --- [수정] AI 응답 로직 (stop_reason 사용) ---
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user" and not st.session_state.interrupt_state:
     with st.chat_message("assistant"):
         with st.spinner("분석 중..."):
@@ -278,7 +285,7 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                 # Agent 생성
                 agent = create_agent(st.session_state.redshift_client)
                 
-                # [핵심 변경] 실행 후 결과 객체 받기 (try-except 제거)
+                # [핵심] 실행 (try-except 제거, 결과 객체로 확인)
                 result = agent(full_prompt)
                 
                 # 1. 인터럽트로 멈춘 경우
@@ -292,7 +299,6 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                         
                         # 임시 Agent로 중간 요약 생성 (Hook 없이)
                         temp_agent = create_agent(st.session_state.redshift_client, with_hook=False)
-                        # 필요한 경우 temp_agent에 메시지 history 복사 로직 추가 가능
                         
                         partial_result = temp_agent(summary_prompt)
                         partial_summary = getattr(partial_result, 'text', str(partial_result))
@@ -315,7 +321,5 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
             except Exception as e:
                 error_msg = f"❌ 오류 발생: {str(e)}"
                 st.error(error_msg)
-                # 디버깅을 위해 상세 에러 출력
-                import traceback
                 st.code(traceback.format_exc())
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
