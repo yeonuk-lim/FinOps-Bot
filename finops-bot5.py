@@ -1,36 +1,47 @@
 import streamlit as st
 import os
 from mcp import stdio_client, StdioServerParameters
-from strands import Agent, Interrupt
+from strands import Agent
+# [변경] Hook 관련 최신 모듈 임포트
+from strands.hooks import HookProvider, HookRegistry, AfterToolCallEvent
 from strands.tools.mcp import MCPClient
-from strands.hooks import HookProvider
 
-# Tool Call Limit Hook
+# -------------------------------------------------------------------------
+# 1. 커스텀 Hook 정의 (최신 버전 문법 적용)
+# -------------------------------------------------------------------------
 class ToolCallLimitHook(HookProvider):
     def __init__(self, soft_limit=5):
         self.soft_limit = soft_limit
         self.tool_call_count = 0
+    
+    # [변경] HookRegistry에 콜백 등록
+    def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
+        # 툴 실행 직후 카운트를 확인하기 위해 AfterToolCallEvent 사용
+        registry.add_callback(AfterToolCallEvent, self.check_limit)
         
-    def on_tool_execution_end(self, event):
+    def check_limit(self, event: AfterToolCallEvent) -> None:
         self.tool_call_count += 1
         
-        if self.tool_call_count == self.soft_limit:
-            raise Interrupt(
-                message=f"이미 {self.soft_limit}번의 쿼리를 실행했습니다.",
-                data={
+        if self.tool_call_count >= self.soft_limit:
+            # [변경] 예외 발생(raise) 대신 event.interrupt() 호출
+            # name: 인터럽트 식별자, reason: 전달할 데이터
+            event.interrupt(
+                name="tool_limit_reached",
+                reason={
                     "tool_calls": self.tool_call_count,
                     "partial_summary_prompt": "지금까지 수집한 정보를 바탕으로 현재까지 알 수 있는 내용을 간단히 요약해주세요."
                 }
             )
-    
-    def on_agent_initialized(self, event):
-        self.tool_call_count = 0
 
-# 1. 페이지 설정
+# -------------------------------------------------------------------------
+# 2. Streamlit 앱 설정
+# -------------------------------------------------------------------------
 st.set_page_config(page_title="Redshift Query Chatbot", page_icon="💰", layout="wide")
 st.title("💰 AWS Cost Analysis Chatbot")
 
-# 2. Redshift 클라이언트 초기화
+# -------------------------------------------------------------------------
+# 3. Redshift 클라이언트 초기화
+# -------------------------------------------------------------------------
 @st.cache_resource
 def init_redshift_client():
     """Redshift MCP 클라이언트 초기화"""
@@ -47,7 +58,9 @@ def init_redshift_client():
     client.start()
     return client
 
-# 3. Agent 생성 함수
+# -------------------------------------------------------------------------
+# 4. Agent 생성 함수
+# -------------------------------------------------------------------------
 def create_agent(mcp_client, with_hook=True):
     tools = mcp_client.list_tools_sync()
     
@@ -91,9 +104,12 @@ LIMIT 10;
     
     hooks = [ToolCallLimitHook(soft_limit=5)] if with_hook else []
     
+    # hooks는 리스트 형태로 전달
     return Agent(tools=tools, system_prompt=system_prompt, hooks=hooks)
 
-# 4. 유틸리티 함수
+# -------------------------------------------------------------------------
+# 5. 유틸리티 함수
+# -------------------------------------------------------------------------
 def get_conversation_context(messages, max_pairs=3):
     if len(messages) <= 1:
         return ""
@@ -110,7 +126,9 @@ def get_conversation_context(messages, max_pairs=3):
 def handle_example_click(message_text):
     st.session_state.messages.append({"role": "user", "content": message_text})
 
-# 5. 세션 상태 초기화
+# -------------------------------------------------------------------------
+# 6. 세션 상태 초기화
+# -------------------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -126,7 +144,9 @@ if "redshift_client" not in st.session_state:
 if "interrupt_state" not in st.session_state:
     st.session_state.interrupt_state = None
 
-# 6. 사이드바 구성
+# -------------------------------------------------------------------------
+# 7. 사이드바 구성
+# -------------------------------------------------------------------------
 with st.sidebar:
     st.header("💡 예시 질문")
     
@@ -176,7 +196,9 @@ with st.sidebar:
         st.session_state.interrupt_state = None
         st.rerun()
 
-# 7. 메인 채팅 영역
+# -------------------------------------------------------------------------
+# 8. 메인 UI 및 로직
+# -------------------------------------------------------------------------
 st.divider()
 
 # 메시지 히스토리 출력
@@ -184,21 +206,36 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Interrupt 상태 처리
+# --- [변경] Interrupt 상태 처리 UI ---
 if st.session_state.interrupt_state:
-    interrupt_data = st.session_state.interrupt_state
+    intr_data = st.session_state.interrupt_state
     
     st.info("**📊 중간 결과 (5번 쿼리 완료)**")
-    st.markdown(interrupt_data["partial_summary"])
+    st.markdown(intr_data["partial_summary"])
     
-    st.warning(f"⚠️ {interrupt_data['message']} 계속 진행하시겠습니까?")
+    st.warning(f"⚠️ {intr_data['message']} 계속 진행하시겠습니까?")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✅ 계속 분석", use_container_width=True):
             with st.spinner("분석 계속 중..."):
                 try:
-                    result_obj = interrupt_data["agent"].resume()
+                    # [핵심 변경] agent.resume() -> agent(responses)
+                    agent = intr_data["agent"]
+                    interrupt_id = intr_data["interrupt_id"]
+                    
+                    # 인터럽트에 대한 응답 구조 생성
+                    responses = [{
+                        "interruptResponse": {
+                            "interruptId": interrupt_id,
+                            "response": "continue" # 훅에서 별도 처리가 필요 없다면 단순 문자열 전달
+                        }
+                    }]
+                    
+                    # 에이전트 재실행 (응답 포함)
+                    result_obj = agent(responses)
+                    
+                    # 결과 처리
                     response_text = getattr(result_obj, 'text', str(result_obj))
                     st.markdown(response_text)
                     st.session_state.messages.append({"role": "assistant", "content": response_text})
@@ -212,18 +249,18 @@ if st.session_state.interrupt_state:
         if st.button("❌ 여기서 마무리", use_container_width=True):
             st.session_state.messages.append({
                 "role": "assistant", 
-                "content": interrupt_data["partial_summary"]
+                "content": intr_data["partial_summary"]
             })
             st.session_state.interrupt_state = None
             st.success("✅ 중간 결과로 마무리했습니다.")
             st.rerun()
 
-# 사용자 입력 처리
+# --- 사용자 입력 처리 ---
 if prompt := st.chat_input("AWS 비용에 대해 질문하세요..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.rerun()
 
-# 8. AI 응답 로직
+# --- [변경] AI 응답 로직 (stop_reason 사용) ---
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user" and not st.session_state.interrupt_state:
     with st.chat_message("assistant"):
         with st.spinner("분석 중..."):
@@ -238,34 +275,47 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                 else:
                     full_prompt = current_question
                 
-                # Agent 생성 및 실행
+                # Agent 생성
                 agent = create_agent(st.session_state.redshift_client)
-                result_obj = agent(full_prompt)
                 
-                # 결과 출력
-                response_text = getattr(result_obj, 'text', str(result_obj))
-                st.markdown(response_text)
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                # [핵심 변경] 실행 후 결과 객체 받기 (try-except 제거)
+                result = agent(full_prompt)
                 
-            except Interrupt as interrupt:
-                # 중간 요약 생성
-                summary_prompt = interrupt.data.get("partial_summary_prompt")
-                
-                # 임시 Agent로 중간 요약 생성 (Hook 없이)
-                temp_agent = create_agent(st.session_state.redshift_client, with_hook=False)
-                temp_agent.messages = agent.messages.copy()
-                partial_result = temp_agent(summary_prompt)
-                partial_summary = getattr(partial_result, 'text', str(partial_result))
-                
-                # Interrupt 상태 저장
-                st.session_state.interrupt_state = {
-                    "message": interrupt.message,
-                    "partial_summary": partial_summary,
-                    "agent": agent
-                }
-                st.rerun()
+                # 1. 인터럽트로 멈춘 경우
+                if getattr(result, "stop_reason", "") == "interrupt":
+                    # 첫 번째 인터럽트 정보 가져오기
+                    interrupt_info = result.interrupts[0]
+                    
+                    if interrupt_info.name == "tool_limit_reached":
+                        # 중간 요약 생성
+                        summary_prompt = interrupt_info.reason.get("partial_summary_prompt", "요약해주세요.")
+                        
+                        # 임시 Agent로 중간 요약 생성 (Hook 없이)
+                        temp_agent = create_agent(st.session_state.redshift_client, with_hook=False)
+                        # 필요한 경우 temp_agent에 메시지 history 복사 로직 추가 가능
+                        
+                        partial_result = temp_agent(summary_prompt)
+                        partial_summary = getattr(partial_result, 'text', str(partial_result))
+                        
+                        # Interrupt 상태 저장
+                        st.session_state.interrupt_state = {
+                            "interrupt_id": interrupt_info.id,
+                            "message": f"{interrupt_info.reason.get('tool_calls')}번 쿼리를 실행했습니다.",
+                            "partial_summary": partial_summary,
+                            "agent": agent # agent 객체를 저장하여 나중에 재개
+                        }
+                        st.rerun()
+
+                # 2. 정상 종료된 경우
+                else:
+                    response_text = getattr(result, 'text', str(result))
+                    st.markdown(response_text)
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
                 
             except Exception as e:
                 error_msg = f"❌ 오류 발생: {str(e)}"
                 st.error(error_msg)
+                # 디버깅을 위해 상세 에러 출력
+                import traceback
+                st.code(traceback.format_exc())
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
