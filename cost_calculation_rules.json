@@ -1,0 +1,76 @@
+{
+  "analysis_goal": "AWS CUR(Cost and Usage Report) 데이터를 기반으로 Redshift용 SQL을 작성한다. 핵심은 RI(Reserved Instance)와 SP(Savings Plan)의 사용 효율과 낭비 비용(Unused)을 정확히 계산하는 것이다.",
+  
+  "field_classification": {
+    "purchase_option": {
+      "description": "구매 옵션 분류",
+      "logic": "CASE WHEN savings_plan_savings_plan_a_r_n IS NOT NULL THEN 'SP' WHEN reservation_reservation_a_r_n IS NOT NULL THEN 'RI' WHEN line_item_usage_type LIKE '%Spot%' THEN 'Spot' ELSE 'OnDemand' END"
+    },
+    "consume_sp_or_ri_id": {
+      "description": "약정 ID 추출",
+      "logic_sp": "SPLIT_PART(savings_plan_savings_plan_a_r_n, '/', 2)",
+      "logic_ri": "reservation_subscription_id"
+    },
+    "purchase_account_id": {
+      "description": "구매 계정 ID",
+      "logic": "SPLIT_PART(savings_plan_savings_plan_a_r_n, ':', 5) for SP, SPLIT_PART(reservation_reservation_a_r_n, ':', 5) for RI"
+    }
+  },
+  
+  "cost_formulas": {
+    "savings_plan": {
+      "sp_used_cost": {
+        "description": "SP 사용 비용 - 약정으로 커버된 실제 지불 비용",
+        "condition": "line_item_line_item_type = 'SavingsPlanCoveredUsage'",
+        "field": "savings_plan_savings_plan_effective_cost",
+        "aggregation": "SUM(savings_plan_savings_plan_effective_cost)"
+      },
+      "sp_unused_cost": {
+        "description": "SP 낭비 비용 - 약정을 샀으나 쓰지 못한 비용",
+        "condition": "line_item_line_item_type = 'SavingsPlanRecurringFee'",
+        "formula": "savings_plan_total_commitment_to_date - savings_plan_used_commitment",
+        "aggregation": "SUM(savings_plan_total_commitment_to_date - savings_plan_used_commitment)"
+      },
+      "sp_total_od_eq_cost": {
+        "description": "SP 절감 효과 비교용 정가 - 약정이 없었을 때 냈어야 할 온디맨드 비용",
+        "condition": "line_item_line_item_type = 'SavingsPlanCoveredUsage'",
+        "field": "pricing_public_on_demand_cost",
+        "aggregation": "SUM(pricing_public_on_demand_cost)"
+      }
+    },
+    "reserved_instance": {
+      "ri_used_cost": {
+        "description": "RI 사용 비용 - 약정으로 커버된 실제 지불 비용",
+        "condition": "line_item_line_item_type = 'DiscountedUsage'",
+        "field": "reservation_effective_cost",
+        "aggregation": "SUM(reservation_effective_cost)"
+      },
+      "ri_unused_cost": {
+        "description": "RI 낭비 비용 - 약정을 샀으나 쓰지 못한 비용",
+        "condition": "line_item_line_item_type = 'RIFee'",
+        "formula": "reservation_unused_amortized_upfront_fee_for_billing_period + reservation_unused_recurring_fee",
+        "aggregation": "SUM(reservation_unused_amortized_upfront_fee_for_billing_period + reservation_unused_recurring_fee)"
+      },
+      "ri_total_od_eq_cost": {
+        "description": "RI 절감 효과 비교용 정가 - 약정이 없었을 때 냈어야 할 온디맨드 비용",
+        "condition": "line_item_line_item_type = 'DiscountedUsage'",
+        "field": "pricing_public_on_demand_cost",
+        "aggregation": "SUM(pricing_public_on_demand_cost)"
+      }
+    }
+  },
+  
+  "redshift_syntax_requirements": {
+    "date_format": "TO_CHAR(date_column, 'YYYY-MM') instead of date_format",
+    "string_split": "SPLIT_PART function",
+    "decimal_type": "CAST cost columns as DECIMAL(24,8)"
+  },
+  
+  "important_notes": [
+    "반드시 line_item_line_item_type 조건으로 필터링하여 각 비용을 계산할 것",
+    "SP와 RI 비용은 절대 혼합하지 말 것 - 각각 별도로 계산",
+    "모든 비용 계산은 SUM() 집계 함수를 사용할 것",
+    "날짜 필터는 항상 line_item_usage_start_date 컬럼 사용",
+    "이 공식은 비즈니스 룰이므로 AI가 임의로 변경하거나 추론하지 말 것"
+  ]
+}
